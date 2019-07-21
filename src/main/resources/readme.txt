@@ -39,3 +39,50 @@ PUT /ik_test/_settings
   "index.translog.durability":"async",
   "index.translog.sync_interval":"20s"
 }
+
+三、关于segment文件的归并
+由上述近实时性搜索的描述, 可知es默认每秒都会产生一个新的segment文件, 而每次搜索时都要遍历所有的segment, 这非常影响搜索性能。
+为解决这一问题，es会对这些零散的segment进行merge(归并)操作，尽量让索引中只保有少量的、体积较大的segment文件。
+归并流程：
+选择一些有相似大小的segment，merge成一个大的segment。
+将新的segment刷新到磁盘上。
+写一个新的commit point，包括了新的segment，并删除旧的segment。
+打开新的segment，完成搜索请求的转移。
+删除旧的小segment。
+
+segment的归并是一个非常消耗系统CPU和磁盘IO资源的任务，所以es对归并线程提供了限速机制，确保这个任务不会过分影响到其他任务。
+默认是20mb，这对写入量较大、磁盘转速较高的服务器来说明显过低，我们这里改成100mb：
+PUT _cluster/settings
+{
+    "persistent" : {
+        "indices.store.throttle.max_bytes_per_sec" : "100mb"
+    }
+}
+5.0开始，es对此作了大幅度改进，使用了Lucene的CMS(ConcurrentMergeScheduler)的auto throttle机制，正常情况下已经不再需要手动配置 indices.store.throttle.max_bytes_per_sec 了。
+官方文档中都已经删除了相关介绍，不过从源码中还是可以看到，这个值目前的默认设置是10240MB。
+
+归并线程的数目
+推荐设置为CPU核心数的一半，如果磁盘性能较差，可以适当降低配置，避免发生磁盘IO堵塞:
+PUT employee/_settings
+{
+    "index.merge.scheduler.max_thread_count" : 8
+}
+5.0之后，归并线程的数目，ES也是有所控制的。默认数目的计算公式是：Math.min(3, Runtime.getRuntime().availableProcessors() / 2)。
+即服务器CPU核数的一半大于3时，启动3个归并线程；否则启动跟CPU核数的一半相等的线程数。
+相信一般做Elastic Stack的服务器CPU合数都会在6个以上。所以一般来说就是3个归并线程。
+如果你确定自己磁盘性能跟不上，可以降低index.merge.scheduler.max_thread_count配置，免得IO情况更加恶化。
+
+归并默认的最大segment大小是5GB，即如果一个segment超过了5GB，那么es就不再对它进行merge。
+那么一个比较庞大的数据索引，就必然会有为数不少的大于5GB的segment永远存在，这对文件句柄，内存等资源都是极大的浪费。
+但是由于归并任务太消耗资源，所以一般不太选择加大index.merge.policy.max_merged_segment配置，而是在负载较低的时间段，通过forcemerge接口，强制归并segment。
+POST /ik_test/_forcemerge
+{
+  "max_num_segments":1
+}
+
+一个segment是一个完备的lucene倒排索引，而倒排索引是通过词典(Term Dictionary)到文档列表(Postings List)的映射关系，快速做查询的。
+所以每个segment都有会一些索引数据驻留在heap里。因此segment越多，瓜分掉的heap也越多，并且这部分heap是无法被GC掉的。
+所以我们应该尽量减少segment对内存的占用，有三种方法：
+1.删除不用的索引。
+2.关闭暂时不用的索引(文件仍然存在于磁盘，只是释放掉内存),需要的时候可重新打开。
+3.定期对不再更新的索引做force merge(之前版本是optimze)，一般选择负载比较小的时间去手动force merge。
