@@ -22,7 +22,7 @@ public class ElasticSearchConfiguration implements InitializingBean, DisposableB
     public void afterPropertiesSet() throws Exception {
         client = new RestHighLevelClient(
                 RestClient.builder(
-                        new HttpHost("192.168.0.100", 9200, "http")
+                        new HttpHost("39.98.138.119", 9200, "http")
                 )
         );
     }
